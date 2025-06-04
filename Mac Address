@@ -1,0 +1,53 @@
+#include "WiFi.h"
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Print ESP32 chip information
+  Serial.println("ESP32 MAC Address Information:");
+  Serial.println("==============================");
+  
+  // Get WiFi MAC address
+  String wifiMac = WiFi.macAddress();
+  Serial.print("WiFi MAC Address: ");
+  Serial.println(wifiMac);
+  
+  // Alternative method to get MAC address as uint64_t
+  uint64_t chipid = ESP.getEfuseMac();
+  Serial.printf("Chip ID (uint64): %04X%08X\n", (uint16_t)(chipid>>32), (uint32_t)chipid);
+  
+  // Format MAC address manually from chip ID
+  Serial.printf("MAC Address (formatted): %02X:%02X:%02X:%02X:%02X:%02X\n",
+                (uint8_t)(chipid >> 40),
+                (uint8_t)(chipid >> 32),
+                (uint8_t)(chipid >> 24),
+                (uint8_t)(chipid >> 16),
+                (uint8_t)(chipid >> 8),
+                (uint8_t)chipid);
+  
+  // Get Bluetooth MAC address (WiFi MAC + 1)
+  uint8_t btMac[6];
+  esp_read_mac(btMac, ESP_MAC_BT);
+  Serial.print("Bluetooth MAC Address: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X", btMac[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+  
+  // Get Ethernet MAC address (if available)
+  uint8_t ethMac[6];
+  esp_read_mac(ethMac, ESP_MAC_ETH);
+  Serial.print("Ethernet MAC Address: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X", ethMac[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+}
+
+void loop() {
+  // Nothing to do here
+  delay(10000);
+}
