@@ -1,0 +1,513 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <TFT_eSPI.h>
+#include <JPEGDecoder.h>
+
+// WiFi settings - Same mobile hotspot as camera
+const char* ssid = "GalaxyA165G5230";
+const char* password = "Sahil@123";
+
+// UDP settings
+WiFiUDP udp;
+const int udpPort = 4210;
+
+// TFT Display
+TFT_eSPI tft = TFT_eSPI();
+
+// Frame buffer for JPEG assembly
+const uint32_t MAX_FRAME_SIZE = 50000; // 50KB max frame size (reduced for QQVGA)
+uint8_t* frameBuffer = nullptr;
+uint32_t frameBufferSize = 0;
+bool frameReadyForDisplay = false;
+
+// Enhanced statistics
+uint32_t framesReceived = 0;
+uint32_t packetsReceived = 0;
+uint32_t droppedFrames = 0;
+uint32_t displayedFrames = 0;
+uint32_t corruptedFrames = 0;
+uint32_t incompleteFrames = 0;
+uint32_t lastStatsTime = 0;
+uint32_t totalBytesReceived = 0;
+const uint32_t STATS_INTERVAL = 10000; // 10 seconds
+
+// Per-frame tracking with timeout handling
+uint16_t currentFrameId = 0;
+uint16_t currentFramePackets = 0;
+uint32_t currentFrameSize = 0;
+uint16_t expectedPackets = 0;
+uint32_t frameStartTime = 0;
+const uint32_t FRAME_TIMEOUT = 2000; // 2 second timeout per frame
+
+// Network quality monitoring
+int lastSignalStrength = 0;
+uint32_t lastPacketTime = 0;
+
+// Error display management
+uint32_t lastErrorTime = 0;
+String lastErrorMessage = "";
+const uint32_t ERROR_DISPLAY_DURATION = 3000; // Show errors for 3 seconds
+
+void setup() {
+  // Initialize TFT first
+  tft.init();
+  tft.setRotation(1); // Landscape
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  
+  showMessage("ESP32 UDP Receiver", "Initializing...", TFT_CYAN);
+  delay(2000);
+  
+  showMessage("Memory Check", "Allocating buffer...", TFT_YELLOW);
+  
+  // Allocate frame buffer
+  frameBuffer = (uint8_t*)malloc(MAX_FRAME_SIZE);
+  if (!frameBuffer) {
+    showError("MEMORY ERROR", "Failed to allocate frame buffer!");
+    while(1) delay(1000);
+  }
+  
+  showMessage("WiFi Connection", "Connecting to hotspot...", TFT_CYAN);
+  
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+  
+  int wifiTimeout = 30;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout > 0) {
+    delay(1000);
+    wifiTimeout--;
+    
+    // Update display during connection
+    showMessage("WiFi Connection", 
+                "Connecting... (" + String(31 - wifiTimeout) + "/30)", 
+                TFT_YELLOW);
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    showError("WIFI FAILED", "Check mobile hotspot");
+    while(1) delay(1000);
+  }
+  
+  // WiFi connected successfully
+  showConnectionInfo();
+  
+  // Start UDP
+  udp.begin(udpPort);
+  
+  showMessage("UDP Server", "Port " + String(udpPort) + " ready", TFT_GREEN);
+  delay(2000);
+  
+  // Show ready status
+  showReadyStatus();
+  
+  lastStatsTime = millis();
+  lastPacketTime = millis();
+}
+
+void loop() {
+  // Handle frame timeout
+  handleFrameTimeout();
+  
+  // Process incoming UDP packets
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    processPacket(packetSize);
+    lastPacketTime = millis();
+  }
+  
+  // Display complete frames
+  if (frameReadyForDisplay) {
+    displayJPEGFrame();
+    frameReadyForDisplay = false;
+  }
+  
+  // Periodic statistics and monitoring
+  if (millis() - lastStatsTime >= STATS_INTERVAL) {
+    updateStatisticsDisplay();
+    monitorNetworkQuality();
+    lastStatsTime = millis();
+  }
+  
+  // Check for no data timeout (camera might be disconnected)
+  if (millis() - lastPacketTime > 10000) { // 10 seconds no data
+    static uint32_t lastNoDataWarning = 0;
+    if (millis() - lastNoDataWarning > 5000) {
+      showTemporaryError("NO VIDEO SIGNAL", "Check camera connection");
+      lastNoDataWarning = millis();
+    }
+  }
+  
+  delay(1); // Small delay for stability
+}
+
+void processPacket(int packetSize) {
+  uint8_t packetBuffer[1500];
+  udp.read(packetBuffer, packetSize);
+  packetsReceived++;
+  totalBytesReceived += packetSize;
+  
+  // Validate minimum packet size
+  if (packetSize < 12) {
+    showTemporaryError("PACKET ERROR", "Packet too small: " + String(packetSize) + " bytes");
+    return;
+  }
+  
+  // Parse packet header: [frameCount(4)][totalPackets(2)][packetIndex(2)][packetSize(4)]
+  uint32_t frame_id = *(uint32_t*)&packetBuffer[0];
+  uint16_t total_packets = *(uint16_t*)&packetBuffer[4];
+  uint16_t packet_idx = *(uint16_t*)&packetBuffer[6];
+  uint32_t packet_size = *(uint32_t*)&packetBuffer[8];
+  
+  // Data starts at byte 12
+  uint8_t* packetData = &packetBuffer[12];
+  
+  // Validate packet data
+  if (packet_size != (packetSize - 12)) {
+    showTemporaryError("PACKET ERROR", "Size mismatch");
+    return;
+  }
+  
+  if (packet_idx >= total_packets) {
+    showTemporaryError("PACKET ERROR", "Invalid packet index");
+    return;
+  }
+  
+  // Validate JPEG header in first packet
+  if (packet_idx == 0) {
+    if (packet_size >= 2 && (packetData[0] != 0xFF || packetData[1] != 0xD8)) {
+      showTemporaryError("JPEG ERROR", "Invalid JPEG header");
+    }
+  }
+  
+  // Handle new frame start
+  if (packet_idx == 0) {
+    // Complete previous frame if it was received fully
+    if (currentFramePackets > 0) {
+      bool wasComplete = (currentFramePackets == expectedPackets);
+      
+      if (wasComplete && currentFrameSize > 0) {
+        frameBufferSize = currentFrameSize;
+        frameReadyForDisplay = true;
+      } else {
+        incompleteFrames++;
+      }
+    }
+    
+    // Start new frame
+    currentFrameId = frame_id;
+    currentFramePackets = 1;
+    currentFrameSize = packet_size;
+    expectedPackets = total_packets;
+    frameStartTime = millis();
+    framesReceived++;
+    
+    // Validate frame size
+    if (currentFrameSize > MAX_FRAME_SIZE) {
+      showTemporaryError("FRAME ERROR", "Frame too large: " + String(currentFrameSize/1024) + "KB");
+      currentFramePackets = 0; // Mark as invalid
+      return;
+    }
+    
+    // Copy first packet data
+    memcpy(frameBuffer, packetData, packet_size);
+    
+  } else {
+    // Continue current frame
+    if (frame_id != currentFrameId) {
+      showTemporaryError("SYNC ERROR", "Frame ID mismatch");
+      return;
+    }
+    
+    if (currentFramePackets == 0) {
+      return; // Skip continuation without start
+    }
+    
+    // Check buffer space
+    if (currentFrameSize + packet_size > MAX_FRAME_SIZE) {
+      showTemporaryError("BUFFER ERROR", "Frame buffer overflow");
+      currentFramePackets = 0; // Mark as invalid
+      droppedFrames++;
+      return;
+    }
+    
+    // Append packet data
+    memcpy(frameBuffer + currentFrameSize, packetData, packet_size);
+    currentFrameSize += packet_size;
+    currentFramePackets++;
+  }
+}
+
+void handleFrameTimeout() {
+  if (currentFramePackets > 0 && (millis() - frameStartTime) > FRAME_TIMEOUT) {
+    showTemporaryError("TIMEOUT", "Frame " + String(currentFrameId) + " incomplete");
+    currentFramePackets = 0; // Reset to drop timed-out frame
+    incompleteFrames++;
+  }
+}
+
+void displayJPEGFrame() {
+  // Validate JPEG header
+  if (frameBufferSize < 10 || frameBuffer[0] != 0xFF || frameBuffer[1] != 0xD8) {
+    corruptedFrames++;
+    showTemporaryError("JPEG ERROR", "Invalid JPEG data");
+    return;
+  }
+  
+  // Decode and display JPEG
+  if (JpegDec.decodeArray(frameBuffer, frameBufferSize)) {
+    // Calculate scaling to fit display
+    float scaleX = (float)tft.width() / JpegDec.width;
+    float scaleY = (float)tft.height() / JpegDec.height;
+    float scale = min(scaleX, scaleY);
+    
+    int displayWidth = JpegDec.width * scale;
+    int displayHeight = JpegDec.height * scale;
+    int offsetX = (tft.width() - displayWidth) / 2;
+    int offsetY = (tft.height() - displayHeight) / 2;
+    
+    // Clear screen and render
+    tft.fillScreen(TFT_BLACK);
+    
+    // Render JPEG to display
+    renderJPEGToTFT(offsetX, offsetY, scale);
+    
+    displayedFrames++;
+    
+    // Show frame info overlay
+    displayFrameOverlay();
+    
+  } else {
+    corruptedFrames++;
+    showTemporaryError("DECODE ERROR", "JPEG decode failed");
+  }
+}
+
+void renderJPEGToTFT(int xpos, int ypos, float scale) {
+  uint16_t *pImg;
+  uint16_t mcu_w = JpegDec.MCUWidth;
+  uint16_t mcu_h = JpegDec.MCUHeight;
+  uint32_t max_x = JpegDec.width;
+  uint32_t max_y = JpegDec.height;
+  
+  // Set correct byte swapping for display
+  bool originalSwap = tft.getSwapBytes();
+  tft.setSwapBytes(true);
+  
+  // Render each MCU block
+  while (JpegDec.read()) {
+    pImg = JpegDec.pImage;
+    
+    // Calculate MCU position in source image
+    int mcu_x = JpegDec.MCUx * mcu_w;
+    int mcu_y = JpegDec.MCUy * mcu_h;
+    
+    // Calculate actual pixels in this MCU
+    uint32_t mcu_pixels_w = min((uint32_t)mcu_w, max_x - mcu_x);
+    uint32_t mcu_pixels_h = min((uint32_t)mcu_h, max_y - mcu_y);
+    
+    // Calculate destination position with scaling
+    int dest_x = xpos + (mcu_x * scale);
+    int dest_y = ypos + (mcu_y * scale);
+    
+    // Bounds checking
+    if (dest_x >= 0 && dest_y >= 0 && dest_x < tft.width() && dest_y < tft.height()) {
+      
+      if (scale >= 0.9 && scale <= 1.1) {
+        // Nearly 1:1 scaling - direct push for speed
+        int final_w = min((int)mcu_pixels_w, tft.width() - dest_x);
+        int final_h = min((int)mcu_pixels_h, tft.height() - dest_y);
+        
+        if (final_w > 0 && final_h > 0) {
+          tft.pushImage(dest_x, dest_y, final_w, final_h, pImg);
+        }
+        
+      } else if (scale > 0.5) {
+        // Reasonable scaling - pixel by pixel
+        for (uint32_t y = 0; y < mcu_pixels_h; y++) {
+          for (uint32_t x = 0; x < mcu_pixels_w; x++) {
+            int screen_x = dest_x + (x * scale);
+            int screen_y = dest_y + (y * scale);
+            
+            if (screen_x >= 0 && screen_x < tft.width() && 
+                screen_y >= 0 && screen_y < tft.height()) {
+              uint16_t pixel = pImg[y * mcu_w + x];
+              
+              if (scale > 1.0) {
+                // Scale up - draw filled rectangle
+                int pixel_size = (int)scale;
+                tft.fillRect(screen_x, screen_y, pixel_size, pixel_size, pixel);
+              } else {
+                // Scale down - single pixel
+                tft.drawPixel(screen_x, screen_y, pixel);
+              }
+            }
+          }
+        }
+      } else {
+        // Very small scaling - sample every other pixel
+        for (uint32_t y = 0; y < mcu_pixels_h; y += 2) {
+          for (uint32_t x = 0; x < mcu_pixels_w; x += 2) {
+            int screen_x = dest_x + (x * scale);
+            int screen_y = dest_y + (y * scale);
+            
+            if (screen_x >= 0 && screen_x < tft.width() && 
+                screen_y >= 0 && screen_y < tft.height()) {
+              uint16_t pixel = pImg[y * mcu_w + x];
+              tft.drawPixel(screen_x, screen_y, pixel);
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  // Restore original swap setting
+  tft.setSwapBytes(originalSwap);
+}
+
+void displayFrameOverlay() {
+  // Frame counter
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("Frame: " + String(currentFrameId), 5, 5, 1);
+  
+  // Image dimensions
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(String(JpegDec.width) + "x" + String(JpegDec.height), 5, 15, 1);
+  
+  // Frame size
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(String(frameBufferSize/1024.0, 1) + "KB", 5, 25, 1);
+  
+  // Live indicator
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString(" LIVE ", tft.width() - 40, 5, 1);
+  
+  // Signal strength indicator
+  int signal = WiFi.RSSI();
+  uint16_t signalColor = (signal > -60) ? TFT_GREEN : (signal > -75) ? TFT_YELLOW : TFT_RED;
+  tft.setTextColor(signalColor, TFT_BLACK);
+  tft.drawString(String(signal) + "dBm", tft.width() - 50, 25, 1);
+}
+
+void showMessage(String title, String message, uint16_t color) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(title, 10, 40, 2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(message, 10, 70, 2);
+}
+
+void showError(String title, String message) {
+  tft.fillScreen(TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString("ERROR", 10, 20, 2);
+  tft.drawString(title, 10, 50, 2);
+  tft.setTextColor(TFT_YELLOW, TFT_RED);
+  tft.drawString(message, 10, 80, 1);
+}
+
+void showTemporaryError(String title, String message) {
+  lastErrorTime = millis();
+  lastErrorMessage = title + ": " + message;
+  
+  // Show error overlay on current display
+  tft.fillRect(0, tft.height() - 60, tft.width(), 60, TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawString(title, 5, tft.height() - 55, 1);
+  tft.setTextColor(TFT_YELLOW, TFT_RED);
+  tft.drawString(message, 5, tft.height() - 40, 1);
+  
+  // Show countdown
+  for (int i = ERROR_DISPLAY_DURATION / 1000; i > 0; i--) {
+    tft.fillRect(tft.width() - 20, tft.height() - 25, 20, 15, TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.drawString(String(i), tft.width() - 15, tft.height() - 25, 1);
+    delay(1000);
+  }
+}
+
+void showConnectionInfo() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("WiFi Connected!", 10, 20, 2);
+  
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("IP: " + WiFi.localIP().toString(), 10, 50, 1);
+  tft.drawString("Gateway: " + WiFi.gatewayIP().toString(), 10, 70, 1);
+  tft.drawString("Signal: " + String(WiFi.RSSI()) + " dBm", 10, 90, 1);
+  
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("Camera Setup:", 10, 120, 1);
+  tft.drawString("udpAddress = \"" + WiFi.localIP().toString() + "\"", 10, 140, 1);
+  
+  delay(5000); // Show for 5 seconds
+}
+
+void showReadyStatus() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("READY", 10, 40, 4);
+  
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Waiting for video stream...", 10, 90, 2);
+  
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("UDP Port: " + String(udpPort), 10, 120, 1);
+  tft.drawString("IP: " + WiFi.localIP().toString(), 10, 140, 1);
+}
+
+void updateStatisticsDisplay() {
+  // Calculate statistics
+  uint32_t elapsedSeconds = STATS_INTERVAL / 1000;
+  float fps = (float)framesReceived / elapsedSeconds;
+  float displayFps = (float)displayedFrames / elapsedSeconds;
+  float throughputKbps = (float)totalBytesReceived * 8 / elapsedSeconds / 1000;
+  float successRate = framesReceived > 0 ? (float)displayedFrames / framesReceived * 100.0f : 0;
+  
+  // Show stats briefly if no video is playing
+  if (displayedFrames == 0 && framesReceived > 0) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("STATISTICS", 10, 10, 2);
+    
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Frames: " + String(framesReceived) + " recv", 10, 40, 1);
+    tft.drawString("Success: " + String(successRate, 1) + "%", 10, 55, 1);
+    tft.drawString("FPS: " + String(fps, 1), 10, 70, 1);
+    tft.drawString("Throughput: " + String(throughputKbps, 1) + " Kbps", 10, 85, 1);
+    
+    if (droppedFrames > 0 || incompleteFrames > 0 || corruptedFrames > 0) {
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawString("Errors:", 10, 105, 1);
+      tft.drawString("Drop:" + String(droppedFrames) + " Inc:" + String(incompleteFrames) + " Cor:" + String(corruptedFrames), 10, 120, 1);
+    }
+    
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("Signal: " + String(WiFi.RSSI()) + " dBm", 10, 140, 1);
+    tft.drawString("Free RAM: " + String(ESP.getFreeHeap()/1024) + " KB", 10, 155, 1);
+    
+    delay(3000); // Show stats for 3 seconds
+  }
+  
+  // Reset counters for next period
+  framesReceived = 0;
+  packetsReceived = 0;
+  displayedFrames = 0;
+  droppedFrames = 0;
+  incompleteFrames = 0;
+  corruptedFrames = 0;
+  totalBytesReceived = 0;
+}
+
+void monitorNetworkQuality() {
+  int currentSignal = WiFi.RSSI();
+  
+  if (abs(currentSignal - lastSignalStrength) > 5) {
+    lastSignalStrength = currentSignal;
+    
+    // Show warning for weak signal
+    if (currentSignal < -80) {
+      showTemporaryError("WEAK SIGNAL", String(currentSignal) + " dBm - Move closer");
+    }
+  }
+}
