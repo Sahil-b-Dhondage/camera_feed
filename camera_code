@@ -1,0 +1,395 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+#define CAMERA_MODEL_AI_THINKER // Has PSRAM
+#include "camera_pins.h"
+
+// WiFi settings - Your mobile hotspot
+const char* ssid = "GalaxyA165G5230";
+const char* password = "Sahil@123";
+
+// UDP settings - IMPORTANT: Update this IP with your receiver's actual IP
+const char *udpAddress = "192.168.231.218";  // ← CHANGE THIS to receiver's IP
+const int udpPort = 4210;
+const int maxPacketSize = 1400;
+
+// LED for status indication
+#define LED_PIN 33
+#define LED_ON LOW
+#define LED_OFF HIGH
+
+// OPTIMIZED Camera settings for better streaming
+#define FRAME_SIZE FRAMESIZE_QQVGA  // 160x120 (small for better streaming)
+#define JPEG_QUALITY 20             // 20 = good balance of quality vs size
+
+// Frame rate control - optimized for mobile hotspot
+unsigned long previousFrameTime = 0;
+const int frameInterval = 200;     // 5 FPS (200ms between frames)
+
+// UDP instance
+WiFiUDP udp;
+
+// Statistics and monitoring
+uint32_t frameCount = 0;
+uint32_t packetCount = 0;
+uint32_t successfulFrames = 0;
+uint32_t droppedFrames = 0;
+uint32_t lastStatsTime = 0;
+uint32_t totalBytesTransmitted = 0;
+
+// Network quality monitoring
+int lastSignalStrength = 0;
+uint32_t consecutiveFailures = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // Give time for serial monitor to connect
+  Serial.println("\n=== ESP32-CAM Optimized JPEG Streaming ===");
+  Serial.println("Format: JPEG (Optimized for mobile hotspot)");
+  Serial.printf("Resolution: 160x120 (QQVGA)\n");
+  Serial.printf("Target frame rate: 5 FPS\n");
+  Serial.printf("JPEG Quality: %d (lower = better quality)\n", JPEG_QUALITY);
+  
+  // Initialize LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_ON); // LED on during setup
+  
+  // Initialize camera with optimized settings
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  
+  // JPEG format configuration
+  config.pixel_format = PIXFORMAT_JPEG;  // Using JPEG format
+  config.frame_size = FRAME_SIZE;        // QQVGA (160x120)
+  config.jpeg_quality = JPEG_QUALITY;    // Quality setting
+  config.fb_count = 2;                   // Double buffering
+  config.grab_mode = CAMERA_GRAB_LATEST; // Always get latest frame
+  config.fb_location = CAMERA_FB_IN_PSRAM; // Use PSRAM for frame buffer
+  
+  // Initialize camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    blinkError();
+  }
+  Serial.println("✓ Camera initialized successfully");
+  
+  // Fine-tune camera settings
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, FRAME_SIZE);     // Confirm frame size
+    s->set_quality(s, JPEG_QUALITY);     // Confirm JPEG quality
+    s->set_brightness(s, 0);             // Default brightness
+    s->set_contrast(s, 0);               // Default contrast
+    s->set_saturation(s, 0);             // Default saturation
+    s->set_gainceiling(s, (gainceiling_t)0); // AGC ceiling
+    s->set_colorbar(s, 0);               // Disable color bar
+    s->set_whitebal(s, 1);               // Enable white balance
+    s->set_gain_ctrl(s, 1);              // Enable gain control
+    s->set_exposure_ctrl(s, 1);          // Enable exposure control
+    s->set_hmirror(s, 0);                // No horizontal mirror
+    s->set_vflip(s, 0);                  // No vertical flip
+    
+    Serial.println("✓ Camera settings optimized");
+  }
+  
+  // Connect to WiFi (mobile hotspot)
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to mobile hotspot");
+  
+  int wifiTimeout = 30; // 30 second timeout
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout > 0) {
+    delay(1000);
+    Serial.print(".");
+    wifiTimeout--;
+    
+    // Blink LED while connecting
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n✗ WiFi connection failed!");
+    blinkError();
+  }
+  
+  Serial.println("\n✓ WiFi connected to mobile hotspot!");
+  Serial.printf("ESP32-CAM IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Gateway (Phone): %s\n", WiFi.gatewayIP().toString().c_str());
+  Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+  Serial.printf("Target Receiver: %s:%d\n", udpAddress, udpPort);
+  
+  // Verify network configuration
+  verifyNetworkSetup();
+  
+  // Start UDP
+  udp.begin(udpPort);
+  Serial.println("✓ UDP initialized");
+  
+  // Setup complete
+  digitalWrite(LED_PIN, LED_OFF);
+  lastStatsTime = millis();
+  
+  Serial.println("\n🚀 Ready to stream JPEG video!");
+  Serial.println("Make sure receiver is running and shows this IP in its range");
+  delay(2000);
+}
+
+void loop() {
+  // Monitor WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ WiFi disconnected, attempting reconnection...");
+    handleWiFiReconnection();
+    return;
+  }
+  
+  // Frame rate control
+  unsigned long currentTime = millis();
+  if (currentTime - previousFrameTime < frameInterval) {
+    return; // Not time for next frame yet
+  }
+  previousFrameTime = currentTime;
+  
+  // Monitor signal quality
+  monitorNetworkQuality();
+  
+  // Capture and send frame
+  digitalWrite(LED_PIN, LED_ON); // LED on during capture/transmission
+  
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("✗ Camera capture failed");
+    consecutiveFailures++;
+    digitalWrite(LED_PIN, LED_OFF);
+    
+    if (consecutiveFailures > 10) {
+      Serial.println("Too many camera failures, restarting...");
+      ESP.restart();
+    }
+    delay(100);
+    return;
+  }
+  
+  consecutiveFailures = 0; // Reset failure counter
+  frameCount++;
+  
+  // Send frame with error handling
+  bool success = sendFrameInChunks(fb);
+  if (success) {
+    successfulFrames++;
+  } else {
+    droppedFrames++;
+  }
+  
+  totalBytesTransmitted += fb->len;
+  
+  // Return frame buffer to camera
+  esp_camera_fb_return(fb);
+  digitalWrite(LED_PIN, LED_OFF);
+  
+  // Print statistics periodically
+  if (millis() - lastStatsTime >= 10000) { // Every 10 seconds
+    printStatistics();
+    lastStatsTime = millis();
+  }
+}
+
+bool sendFrameInChunks(camera_fb_t *fb) {
+  size_t totalBytes = fb->len;
+  size_t payloadPerPacket = maxPacketSize - 12; // 12-byte header
+  uint16_t totalPackets = (totalBytes + payloadPerPacket - 1) / payloadPerPacket;
+  
+  // Skip extremely large frames (usually indicates camera issues)
+  if (totalBytes > 25000) { // 25KB limit for QQVGA JPEG
+    Serial.printf("⚠️ Skipping oversized frame: %u bytes\n", totalBytes);
+    return false;
+  }
+  
+  // Log frame info occasionally
+  if (frameCount % 25 == 0) {
+    Serial.printf("📸 Frame %u: %u bytes → %u packets\n", 
+                 frameCount, totalBytes, totalPackets);
+  }
+  
+  uint32_t successfulPackets = 0;
+  uint32_t startTime = millis();
+  
+  // Send each packet
+  for (uint16_t packetIndex = 0; packetIndex < totalPackets; packetIndex++) {
+    size_t offset = packetIndex * payloadPerPacket;
+    size_t packetDataSize = min(payloadPerPacket, totalBytes - offset);
+    
+    // Create packet buffer
+    uint8_t packetBuffer[12 + packetDataSize];
+    
+    // Build packet header: [frameCount(4)][totalPackets(2)][packetIndex(2)][packetSize(4)][data...]
+    memcpy(packetBuffer, &frameCount, 4);
+    memcpy(packetBuffer + 4, &totalPackets, 2);
+    memcpy(packetBuffer + 6, &packetIndex, 2);
+    memcpy(packetBuffer + 8, &packetDataSize, 4);
+    
+    // Copy JPEG data
+    memcpy(packetBuffer + 12, fb->buf + offset, packetDataSize);
+    
+    // Send packet with retry logic
+    bool packetSent = false;
+    int maxRetries = (WiFi.RSSI() > -60) ? 1 : 2; // More retries for weak signal
+    
+    for (int retry = 0; retry < maxRetries && !packetSent; retry++) {
+      udp.beginPacket(udpAddress, udpPort);
+      udp.write(packetBuffer, 12 + packetDataSize);
+      packetSent = udp.endPacket();
+      
+      if (packetSent) {
+        successfulPackets++;
+        packetCount++;
+      } else if (retry < maxRetries - 1) {
+        delay(3); // Wait before retry
+      }
+    }
+    
+    // Adaptive pacing based on signal strength
+    int signalStrength = WiFi.RSSI();
+    if (signalStrength > -50) {
+      delay(2);  // Strong signal - fast transmission
+    } else if (signalStrength > -70) {
+      delay(4);  // Medium signal - moderate speed
+    } else {
+      delay(8);  // Weak signal - slow transmission
+    }
+    
+    // Extra delay every 10 packets to prevent buffer overflow
+    if (packetIndex % 10 == 0 && packetIndex > 0) {
+      delay(5);
+    }
+  }
+  
+  uint32_t transmissionTime = millis() - startTime;
+  float successRate = (float)successfulPackets / totalPackets * 100.0f;
+  
+  // Log transmission issues
+  if (successRate < 95.0f) {
+    Serial.printf("⚠️ Frame %u transmission issues: %.1f%% success, %ums\n", 
+                 frameCount, successRate, transmissionTime);
+  }
+  
+  return successRate >= 90.0f; // Consider successful if ≥90% packets sent
+}
+
+void verifyNetworkSetup() {
+  IPAddress myIP = WiFi.localIP();
+  IPAddress targetIP;
+  
+  if (!targetIP.fromString(udpAddress)) {
+    Serial.println("✗ ERROR: Invalid target IP address format!");
+    Serial.println("Please update udpAddress with receiver's actual IP");
+    blinkError();
+  }
+  
+  Serial.printf("\n📡 Network Configuration Check:\n");
+  Serial.printf("   My IP: %s\n", myIP.toString().c_str());
+  Serial.printf("   Target IP: %s\n", targetIP.toString().c_str());
+  
+  // Check if in same subnet (should be for mobile hotspot)
+  if (myIP[0] == targetIP[0] && myIP[1] == targetIP[1] && myIP[2] == targetIP[2]) {
+    Serial.println("   ✓ IPs are in same subnet - should work!");
+  } else {
+    Serial.println("   ✗ WARNING: IPs in different subnets - may not work!");
+    Serial.println("   Update udpAddress with correct receiver IP");
+  }
+}
+
+void handleWiFiReconnection() {
+  digitalWrite(LED_PIN, LED_ON);
+  WiFi.reconnect();
+  
+  int reconnectTimeout = 15;
+  while (WiFi.status() != WL_CONNECTED && reconnectTimeout > 0) {
+    delay(1000);
+    Serial.print(".");
+    reconnectTimeout--;
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Blink during reconnection
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi reconnected!");
+    digitalWrite(LED_PIN, LED_OFF);
+  } else {
+    Serial.println("\n✗ WiFi reconnection failed, restarting...");
+    ESP.restart();
+  }
+}
+
+void monitorNetworkQuality() {
+  static uint32_t lastNetworkCheck = 0;
+  
+  if (millis() - lastNetworkCheck > 5000) { // Check every 5 seconds
+    int currentSignal = WiFi.RSSI();
+    
+    if (abs(currentSignal - lastSignalStrength) > 10) {
+      Serial.printf("📶 Signal change: %d → %d dBm\n", 
+                   lastSignalStrength, currentSignal);
+      lastSignalStrength = currentSignal;
+    }
+    
+    lastNetworkCheck = millis();
+  }
+}
+
+void printStatistics() {
+  uint32_t elapsedSeconds = (millis() - (lastStatsTime - 10000)) / 1000;
+  if (elapsedSeconds == 0) elapsedSeconds = 1; // Prevent division by zero
+  
+  float actualFPS = (float)frameCount / elapsedSeconds;
+  float successRate = frameCount > 0 ? (float)successfulFrames / frameCount * 100.0f : 0;
+  float avgFrameSize = frameCount > 0 ? (float)totalBytesTransmitted / frameCount : 0;
+  float throughputKbps = (float)totalBytesTransmitted * 8 / elapsedSeconds / 1000;
+  
+  Serial.println("\n📊 === STREAMING STATISTICS ===");
+  Serial.printf("Time: %u seconds\n", elapsedSeconds);
+  Serial.printf("Frames: %u total, %u successful (%.1f%%)\n", 
+               frameCount, successfulFrames, successRate);
+  Serial.printf("Packets: %u transmitted\n", packetCount);
+  Serial.printf("Frame Rate: %.1f FPS (target: %.1f)\n", 
+               actualFPS, 1000.0f/frameInterval);
+  Serial.printf("Average Frame Size: %.1f KB\n", avgFrameSize/1024);
+  Serial.printf("Throughput: %.1f Kbps\n", throughputKbps);
+  Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+  Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
+  Serial.println("================================\n");
+  
+  // Reset counters for next period
+  frameCount = 0;
+  successfulFrames = 0;
+  droppedFrames = 0;
+  packetCount = 0;
+  totalBytesTransmitted = 0;
+}
+
+void blinkError() {
+  Serial.println("System error - check connections and restart");
+  while(1) {
+    digitalWrite(LED_PIN, LED_ON);
+    delay(200);
+    digitalWrite(LED_PIN, LED_OFF);
+    delay(200);
+  }
+}
